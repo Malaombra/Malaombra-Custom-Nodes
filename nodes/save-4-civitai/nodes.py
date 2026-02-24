@@ -2,9 +2,11 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 import comfy.samplers
+import comfy.utils
 import folder_paths
 import numpy as np
 import piexif
@@ -12,6 +14,10 @@ import piexif.helper
 from nodes import MAX_RESOLUTION
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+
+DEFAULT_TIME_FORMAT = "%Y-%m-%d-%H%M%S"
+TERMINAL_PROGRESS_WIDTH = 28
+_MODEL_HASH_CACHE = {}
 
 
 def parse_name(ckpt_name):
@@ -30,31 +36,49 @@ def calculate_sha256(file_path):
     return sha256_hash.hexdigest()
 
 
+def get_cached_model_hash(file_path):
+    if not file_path:
+        return "unknown"
+
+    try:
+        stat = os.stat(file_path)
+    except OSError:
+        return "unknown"
+
+    cache_key = (stat.st_mtime_ns, stat.st_size)
+    cached = _MODEL_HASH_CACHE.get(file_path)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    model_hash = calculate_sha256(file_path)[:10]
+    _MODEL_HASH_CACHE[file_path] = (cache_key, model_hash)
+    return model_hash
+
+
 def handle_whitespace(string: str):
     return string.strip().replace("\n", " ").replace("\r", " ").replace("\t", " ")
 
 
-def get_timestamp(time_format):
+def get_timestamp(time_format=DEFAULT_TIME_FORMAT):
     now = datetime.now()
     try:
         timestamp = now.strftime(time_format)
     except Exception:
-        timestamp = now.strftime("%Y-%m-%d-%H%M%S")
+        timestamp = now.strftime(DEFAULT_TIME_FORMAT)
     return timestamp
 
 
-def make_pathname(filename, seed, modelname, counter, time_format):
+def make_pathname(filename, seed, modelname):
     filename = filename.replace("%date", get_timestamp("%Y-%m-%d"))
-    filename = filename.replace("%time", get_timestamp(time_format))
+    filename = filename.replace("%time", get_timestamp(DEFAULT_TIME_FORMAT))
     filename = filename.replace("%model", modelname)
     filename = filename.replace("%seed", str(seed))
-    filename = filename.replace("%counter", str(counter))
     return filename
 
 
-def make_filename(filename, seed, modelname, counter, time_format):
-    filename = make_pathname(filename, seed, modelname, counter, time_format)
-    return get_timestamp(time_format) if filename == "" else filename
+def make_filename(filename, seed, modelname):
+    filename = make_pathname(filename, seed, modelname)
+    return get_timestamp(DEFAULT_TIME_FORMAT) if filename == "" else filename
 
 
 def _iter_model_types():
@@ -158,6 +182,35 @@ def build_output_filename(filename_prefix, extension, counter_value, filename_nu
     return f"{counter_stem}.{extension}"
 
 
+def get_output_size(images, enable_resize, max_long_side):
+    out_height = int(images.shape[1])
+    out_width = int(images.shape[2])
+
+    if enable_resize and max_long_side > 0:
+        longest = max(out_width, out_height)
+        if longest > max_long_side:
+            scale = max_long_side / float(longest)
+            out_width = max(1, int(round(out_width * scale)))
+            out_height = max(1, int(round(out_height * scale)))
+
+    return out_width, out_height
+
+
+def print_terminal_progress(prefix, current, total):
+    safe_total = max(int(total), 1)
+    safe_current = min(max(int(current), 0), safe_total)
+    progress = safe_current / safe_total
+    filled = int(round(TERMINAL_PROGRESS_WIDTH * progress))
+    bar = "#" * filled + "-" * (TERMINAL_PROGRESS_WIDTH - filled)
+    print(
+        f"\r{prefix} [{bar}] {safe_current}/{safe_total} ({progress * 100:5.1f}%)",
+        end="",
+        flush=True,
+    )
+    if safe_current >= safe_total:
+        print()
+
+
 class Save4CivitAI:
     CATEGORY = "Malaombra-Custom-Nodes/Image"
     RETURN_TYPES = ()
@@ -176,6 +229,8 @@ class Save4CivitAI:
                 "path": ("STRING", {"default": "", "multiline": False}),
                 "extension": (["png", "jpeg", "webp"],),
                 "filename_number_padding": ("INT", {"default": 4, "min": 1, "max": 9, "step": 1}),
+                "enable_resize": ("BOOLEAN", {"default": False}),
+                "max_long_side": ("INT", {"default": 1024, "min": 64, "max": MAX_RESOLUTION, "step": 8}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
                 "modelname": (folder_paths.get_filename_list("checkpoints"),),
@@ -186,12 +241,8 @@ class Save4CivitAI:
                 "positive": ("STRING", {"default": "unknown", "multiline": True}),
                 "negative": ("STRING", {"default": "unknown", "multiline": True}),
                 "seed_value": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "width": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 8}),
-                "height": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 8}),
                 "lossless_webp": ("BOOLEAN", {"default": True}),
                 "quality_jpeg_or_webp": ("INT", {"default": 100, "min": 1, "max": 100}),
-                "counter": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "time_format": ("STRING", {"default": "%Y-%m-%d-%H%M%S", "multiline": False}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -205,6 +256,8 @@ class Save4CivitAI:
         seed_value,
         steps,
         cfg,
+        enable_resize,
+        max_long_side,
         sampler_name,
         scheduler,
         positive,
@@ -212,25 +265,23 @@ class Save4CivitAI:
         modelname,
         quality_jpeg_or_webp,
         lossless_webp,
-        width,
-        height,
-        counter,
         filename,
         path,
         extension,
         filename_number_padding,
-        time_format,
         prompt=None,
         extra_pnginfo=None,
     ):
+        execution_start = time.perf_counter()
+        total_images = int(images.size()[0])
         resolved_name, model_path, model_type = resolve_model_file(modelname)
         model_label = _safe_model_label(resolved_name if resolved_name else modelname)
 
-        filename = make_filename(filename, seed_value, model_label, counter, time_format)
-        path = make_pathname(path, seed_value, model_label, counter, time_format)
+        filename = make_filename(filename, seed_value, model_label)
+        path = make_pathname(path, seed_value, model_label)
 
         if model_path is not None:
-            modelhash = calculate_sha256(model_path)[:10]
+            modelhash = get_cached_model_hash(model_path)
         else:
             modelhash = "unknown"
             print(f"[Save 4 CivitAI] Could not resolve model path for '{modelname}'.")
@@ -239,18 +290,28 @@ class Save4CivitAI:
         if model_type and model_type != "checkpoints":
             model_desc = f"{model_label} ({model_type})"
 
+        output_width, output_height = get_output_size(images, enable_resize, max_long_side)
+
         comment = (
             f"{handle_whitespace(positive)}\n"
             f"Negative prompt: {handle_whitespace(negative)}\n"
             f"Steps: {steps}, Sampler: {sampler_name}{f'_{scheduler}' if scheduler != 'normal' else ''}, "
-            f"CFG Scale: {cfg}, Seed: {seed_value}, Size: {width}x{height}, "
+            f"CFG Scale: {cfg}, Seed: {seed_value}, Size: {output_width}x{output_height}, "
             f"Model hash: {modelhash}, Model: {model_desc}, Version: ComfyUI"
         )
 
         output_path = os.path.join(self.output_dir, path)
         os.makedirs(output_path, exist_ok=True)
 
+        print(
+            f"[Save 4 CivitAI] Start save: images={total_images}, ext={extension}, "
+            f"resize={'on' if enable_resize else 'off'}, max_long_side={max_long_side}"
+        )
+        print(f"[Save 4 CivitAI] Output path: {output_path}")
+
         counter_start = find_next_filename_counter(output_path, filename, extension)
+        print(f"[Save 4 CivitAI] Filename prefix: {filename}, next counter: {counter_start}")
+
         filenames = self.save_images(
             images,
             output_path,
@@ -261,9 +322,13 @@ class Save4CivitAI:
             lossless_webp,
             filename_number_padding,
             counter_start,
+            enable_resize,
+            max_long_side,
             prompt,
             extra_pnginfo,
         )
+        elapsed = time.perf_counter() - execution_start
+        print(f"[Save 4 CivitAI] Completed: saved={len(filenames)} image(s) in {elapsed:.2f}s")
 
         subfolder = os.path.normpath(path)
         ui_images = [
@@ -287,11 +352,14 @@ class Save4CivitAI:
         lossless_webp,
         filename_number_padding,
         counter_start,
+        enable_resize,
+        max_long_side,
         prompt=None,
         extra_pnginfo=None,
     ):
         total_images = int(images.size()[0])
         counter_value = counter_start
+        pbar = comfy.utils.ProgressBar(total_images)
 
         while True:
             collision = False
@@ -312,10 +380,26 @@ class Save4CivitAI:
             counter_value += 1
 
         paths = []
-        img_count = 1
-        for image in images:
-            array = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+        print_terminal_progress("[Save 4 CivitAI] Saving", 0, total_images)
+        exif_bytes = None
+        if extension != "png":
+            exif_bytes = piexif.dump(
+                {
+                    "Exif": {
+                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                            comment,
+                            encoding="unicode",
+                        )
+                    }
+                }
+            )
+
+        for img_count, image in enumerate(images, start=1):
+            array = np.clip(image.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+            img = Image.fromarray(array)
+            if enable_resize and max_long_side > 0:
+                img.thumbnail((max_long_side, max_long_side), Image.Resampling.LANCZOS)
+
             out_name = build_output_filename(
                 filename_prefix,
                 extension,
@@ -336,27 +420,17 @@ class Save4CivitAI:
                     for key in extra_pnginfo:
                         metadata.add_text(key, json.dumps(extra_pnginfo[key]))
 
-                img.save(out_file, pnginfo=metadata, optimize=True)
+                img.save(out_file, pnginfo=metadata)
             else:
-                save_kwargs = {"optimize": True, "quality": quality_jpeg_or_webp}
+                save_kwargs = {"quality": quality_jpeg_or_webp, "exif": exif_bytes}
                 if extension == "webp":
                     save_kwargs["lossless"] = lossless_webp
 
                 img.save(out_file, **save_kwargs)
-                exif_bytes = piexif.dump(
-                    {
-                        "Exif": {
-                            piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
-                                comment,
-                                encoding="unicode",
-                            )
-                        }
-                    }
-                )
-                piexif.insert(exif_bytes, out_file)
 
             paths.append(out_name)
-            img_count += 1
+            pbar.update_absolute(img_count, total_images)
+            print_terminal_progress("[Save 4 CivitAI] Saving", img_count, total_images)
 
         return paths
 
