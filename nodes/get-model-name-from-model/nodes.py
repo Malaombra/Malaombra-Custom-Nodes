@@ -290,6 +290,6 @@ class GetModelNameFromModel:
 
 
 NODE_CLASS_MAPPINGS = {
-    "get-model-name-from-model": GetModelNameFromModel,
+    "Get Model Name from MODEL": GetModelNameFromModel,
 }
 
