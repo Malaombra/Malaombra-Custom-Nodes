@@ -27,12 +27,11 @@ class MalaombraVideoCombine(VHSVideoCombine):
     def INPUT_TYPES(cls):
         inputs = super().INPUT_TYPES()
         inputs["required"] = dict(inputs["required"])
-        inputs["required"]["pix_fmt"] = (["yuv420p", "yuv420p10le"], {"default": "yuv420p"})
+        inputs["required"].pop("pingpong", None)
+        inputs["required"].pop("save_output", None)
         inputs["required"]["crf"] = ("INT", {"default": 19, "min": 0, "max": 100, "step": 1})
-        inputs["required"]["save_metadata"] = ("BOOLEAN", {"default": True})
-        inputs["required"]["trim_to_audio"] = ("BOOLEAN", {"default": False})
-        inputs["required"]["save_output"] = ("BOOLEAN", {"default": False})
         inputs["required"]["show_preview"] = ("BOOLEAN", {"default": True})
+        inputs["required"]["save_output"] = ("BOOLEAN", {"default": False})
         return inputs
 
     RETURN_TYPES = ("VHS_FILENAMES", "VIDEO")
@@ -42,7 +41,13 @@ class MalaombraVideoCombine(VHSVideoCombine):
     OUTPUT_NODE = True
 
     def combine_video(self, show_preview=True, save_output=False, **kwargs):
-        result = super().combine_video(save_output=save_output, **kwargs)
+        result = super().combine_video(
+            save_output=save_output,
+            pingpong=False,
+            pix_fmt="yuv420p",
+            trim_to_audio=False,
+            **kwargs,
+        )
 
         if not isinstance(result, dict):
             return result
