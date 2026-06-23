@@ -27,6 +27,10 @@ class MalaombraVideoCombine(VHSVideoCombine):
     def INPUT_TYPES(cls):
         inputs = super().INPUT_TYPES()
         inputs["required"] = dict(inputs["required"])
+        inputs["required"]["pix_fmt"] = (["yuv420p", "yuv420p10le"], {"default": "yuv420p"})
+        inputs["required"]["crf"] = ("INT", {"default": 19, "min": 0, "max": 100, "step": 1})
+        inputs["required"]["save_metadata"] = ("BOOLEAN", {"default": True})
+        inputs["required"]["trim_to_audio"] = ("BOOLEAN", {"default": False})
         inputs["required"]["save_output"] = ("BOOLEAN", {"default": False})
         inputs["required"]["show_preview"] = ("BOOLEAN", {"default": True})
         return inputs
@@ -50,6 +54,10 @@ class MalaombraVideoCombine(VHSVideoCombine):
 
         if not (show_preview or save_output):
             result = {key: value for key, value in result.items() if key != "ui"}
+        elif "ui" in result and "gifs" in result["ui"]:
+            result["ui"] = dict(result["ui"])
+            result["ui"]["images"] = result["ui"]["gifs"]
+            result["ui"]["animated"] = (True,)
 
         result["result"] = (filenames, video)
         return result
