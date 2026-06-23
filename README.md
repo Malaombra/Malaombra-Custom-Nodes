@@ -20,8 +20,13 @@
 ### 3) get-model-name-from-model
 - Node that tries to resolve the model name used in the workflow by traversing prompt/upstream node data.
 
+### 4) Video Combine
+- Video Helper Suite based video combine node that outputs a standard ComfyUI `VIDEO`.
+- Includes `show_preview` to display a preview even when `save_output` is disabled.
+
 ## Credits and Origin
 
 - **Save 4 CivitAI** and **Seed Generator** are inspired by `comfyui-image-saver`, with small optimizations for robustness and integration.
 - **get-model-name-from-model** and its model-resolution logic are original development.
+- **Video Combine** is based on `ComfyUI-VideoHelperSuite` and requires it to be installed.
 
